@@ -1,0 +1,115 @@
+name: Auto clip
+
+# Start it three ways:
+#   1. GitHub -> Actions -> "Auto clip" -> Run workflow (works from the GitHub phone app too): paste the link.
+#   2. From Activepieces / any tool: POST https://api.github.com/repos/OWNER/REPO/dispatches
+#        {"event_type":"auto-clip","client_payload":{"url":"https://www.youtube.com/watch?v=...","count":3}}
+#      with a fine-grained token that has "Contents: write" on this repo.
+#   3. Re-run any earlier run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: YouTube / Twitch / Kick link
+        required: true
+      count:
+        description: How many clips (1-12)
+        default: '3'
+      min_len:
+        description: Shortest clip (seconds)
+        default: '30'
+      max_len:
+        description: Longest clip (seconds)
+        default: '60'
+      layout:
+        description: blur, fill, stack, bottom, game, pip_tl, pip_tr, pip_bl, pip_br
+        default: blur
+      caption_style:
+        description: gta, bold, clean, hormozi, mrbeast
+        default: gta
+      language:
+        description: Leave empty for auto. hinglish, hi, en ...
+        default: ''
+      hashtags:
+        description: Added to the post caption
+        default: '#shorts'
+      use_ollama:
+        description: Install a small AI model for titles and hooks (adds ~5 min)
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [auto-clip]
+
+permissions:
+  contents: write   # lets the job publish clips as release assets
+
+concurrency:
+  group: auto-clip
+  cancel-in-progress: false
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Inputs go through env vars, never straight into the shell, so a crafted link cannot run commands.
+      IN_URL: ${{ github.event.inputs.url || github.event.client_payload.url }}
+      IN_COUNT: ${{ github.event.inputs.count || github.event.client_payload.count || '3' }}
+      IN_MIN: ${{ github.event.inputs.min_len || github.event.client_payload.min_len || '30' }}
+      IN_MAX: ${{ github.event.inputs.max_len || github.event.client_payload.max_len || '60' }}
+      IN_LAYOUT: ${{ github.event.inputs.layout || github.event.client_payload.layout || 'blur' }}
+      IN_STYLE: ${{ github.event.inputs.caption_style || github.event.client_payload.caption_style || 'gta' }}
+      IN_LANG: ${{ github.event.inputs.language || github.event.client_payload.language || '' }}
+      IN_TAGS: ${{ github.event.inputs.hashtags || github.event.client_payload.hashtags || '#shorts' }}
+      IN_OLLAMA: ${{ github.event.inputs.use_ollama || github.event.client_payload.use_ollama || 'false' }}
+      ACTIVEPIECES_WEBHOOK_URL: ${{ secrets.ACTIVEPIECES_WEBHOOK_URL }}
+      AP_WEBHOOK_SECRET: ${{ secrets.AP_WEBHOOK_SECRET }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install FFmpeg and Python packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install -r requirements.txt
+
+      - name: Optional AI model for titles and hooks
+        if: env.IN_OLLAMA == 'true'
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          (ollama serve > /tmp/ollama.log 2>&1 &)
+          sleep 5
+          ollama pull llama3.2:3b
+
+      - name: YouTube cookies (optional)
+        env:
+          YT_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          mkdir -p data
+          if [ -n "$YT_COOKIES" ]; then printf '%s\n' "$YT_COOKIES" > data/youtube_cookies.txt; fi
+
+      - name: Make clips and send to Activepieces
+        run: |
+          python auto_clip.py "$IN_URL" \
+            --count "$IN_COUNT" --min-len "$IN_MIN" --max-len "$IN_MAX" \
+            --layout "$IN_LAYOUT" --caption-style "$IN_STYLE" \
+            --language "$IN_LANG" --hashtags "$IN_TAGS" \
+            --delivery github-release --out out --data data
+
+      - name: Keep a copy as a workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clips
+          path: |
+            out/
+            data/server.log
+          retention-days: 3
+          if-no-files-found: ignore
